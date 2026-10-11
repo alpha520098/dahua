@@ -1,0 +1,398 @@
+--- a/custom_components/dahua/__init__.py
++++ b/custom_components/dahua/__init__.py
+@@ -24,6 +24,7 @@
+ from . import dahua_utils
+ from .client import DahuaClient
+ from .model_profiles import is_sdt4e425
++from .ivs import IVSRuleTracker, rules_from_flat, rules_from_remote
+ 
+ from .const import (
+     CONF_EVENTS,
+@@ -186,6 +187,11 @@
+         self._last_plate_data: dict = {}
+         self._last_plate_timestamp: int = 0
+         self._plate_listeners: list = []
++
++        # Optional IVS additions have their own state and callbacks. Existing
++        # event sensors, entity IDs and stream subscriptions remain independent.
++        self._ivs_tracker = None
++        self._ivs_rule_listeners = {}
+ 
+         super().__init__(
+             hass,
+@@ -639,6 +645,10 @@
+             self._handle_anpr_plate(event)
+             self.hass.bus.fire("dahua_event_received", event)
+ 
++            # The optional IVS path handles code-level Stops with missing data.
++            # Its own errors are contained before legacy callbacks run.
++            self._handle_ivs_rule_event(event)
++
+             # When there's an event start we'll update the a map x to the current timestamp in seconds for the event.
+             # We'll reset it to 0 when the event stops.
+             # We'll use these timestamps in binary_sensor to know how long to trigger the sensor
+@@ -657,6 +667,62 @@
+                     elif action == "Stop":
+                         self._dahua_event_timestamp[event_key] = 0
+                         listener()
++
++    async def async_discover_ivs_rules(self):
++        """Discover read-only IVS sensors without changing any camera settings."""
++        rules = []
++        is_recorder = any(kind in str(self.model).upper() for kind in ("NVR", "DVR", "XVR"))
++        try:
++            if is_recorder:
++                # This per-channel table is authoritative on Web5.0 NVRs.
++                table = await self.client.async_get_remote_ivs_rules(self._channel)
++                rules = rules_from_remote(table, self._channel)
++            else:
++                table = await self.client.async_get_ivs_rules()
++                rules = rules_from_flat(table, self._channel)
++        except Exception as error:
++            # An optional rule read must never take working motion sensors down.
++            _LOGGER.warning(
++                "Hybrid IVS discovery unavailable for %s channel %s (%s); existing sensors continue",
++                self._address, self._channel, type(error).__name__,
++            )
++            return []
++        self._ivs_tracker = IVSRuleTracker(rules)
++        _LOGGER.info(
++            "Hybrid IVS discovery: %s channel %s, %s normal rules",
++            self._address, self._channel, len(rules),
++        )
++        return rules
++
++    def _handle_ivs_rule_event(self, event):
++        """Dispatch optional rule state without interrupting legacy callbacks."""
++        tracker = self._ivs_tracker
++        if tracker is None:
++            return
++        try:
++            previous = tracker.unmatched_count
++            changed = tracker.apply(event)
++            if tracker.unmatched_count > previous and previous == 0:
++                _LOGGER.warning(
++                    "Hybrid IVS event ID does not match discovery on %s channel %s: %s; no rule guessed",
++                    self._address, self._channel, tracker.last_unmatched,
++                )
++            for identity in changed:
++                listener = self._ivs_rule_listeners.get(identity)
++                if listener is not None:
++                    listener()
++        except Exception:
++            _LOGGER.exception("Optional hybrid IVS event handling failed")
++
++    def add_ivs_rule_listener(self, identity, listener):
++        """Register one new IVS entity and return its unload cleanup."""
++        self._ivs_rule_listeners[identity] = listener
++
++        def remove():
++            if self._ivs_rule_listeners.get(identity) is listener:
++                self._ivs_rule_listeners.pop(identity, None)
++
++        return remove
+ 
+     def translate_event_code(self, event: dict):
+         """
+--- a/custom_components/dahua/binary_sensor.py
++++ b/custom_components/dahua/binary_sensor.py
+@@ -1,6 +1,7 @@
+ """Binary sensor platform for dahua."""
+ import time
+ import re
++import logging
+ 
+ from homeassistant.components.binary_sensor import BinarySensorDeviceClass, BinarySensorEntity
+ from homeassistant.core import HomeAssistant, callback
+@@ -42,6 +43,8 @@
+     "AudioMutation": VOLUME_HIGH_ICON,
+ }
+ 
++_LOGGER = logging.getLogger(__package__)
++
+ 
+ async def async_setup_entry(hass: HomeAssistant, entry, async_add_devices):
+     """Setup binary_sensor platform."""
+@@ -62,6 +65,24 @@
+ 
+     if sensors:
+         async_add_devices(sensors)
++
++    # Existing sensors are added immediately. Read optional IVS configuration in
++    # the background so an NVR refusal cannot delay their creation.
++    if not coordinator.is_doorbell():
++        async def add_ivs_sensors():
++            try:
++                rules = await coordinator.async_discover_ivs_rules()
++                if rules:
++                    async_add_devices([
++                        DahuaIVSRuleBinarySensor(coordinator, entry, rule)
++                        for rule in rules
++                    ])
++            except Exception:
++                _LOGGER.exception("Optional hybrid IVS sensors could not be added")
++
++        entry.async_create_background_task(
++            hass, add_ivs_sensors(), "Dahua hybrid IVS discovery", eager_start=False,
++        )
+ 
+ 
+ class DahuaEventSensor(DahuaBaseEntity, BinarySensorEntity):
+@@ -134,6 +155,53 @@
+     @property
+     def should_poll(self) -> bool:
+         """Return True if entity has to be polled for state.  False if entity pushes its state to HA"""
++        return False
++
++
++class DahuaIVSRuleBinarySensor(DahuaBaseEntity, BinarySensorEntity):
++    """Report detection on one normal IVS rule, independently of enable switches."""
++
++    def __init__(self, coordinator, entry, rule):
++        DahuaBaseEntity.__init__(self, coordinator, entry)
++        BinarySensorEntity.__init__(self)
++        self._rule = dict(rule)
++        self._attr_device_class = MOTION_SENSOR_DEVICE_CLASS
++        self._attr_icon = "mdi:motion-sensor"
++
++    @property
++    def unique_id(self):
++        return f"{self._coordinator.get_serial_number()}_ivs_rule_{self._rule['id']}"
++
++    @property
++    def name(self):
++        return f"{self._coordinator.get_device_name()} {self._rule['name']}"
++
++    @property
++    def is_on(self):
++        tracker = self._coordinator._ivs_tracker
++        return bool(tracker and tracker.states.get(self._rule["id"], False))
++
++    @property
++    def extra_state_attributes(self):
++        tracker = self._coordinator._ivs_tracker
++        details = tracker.details.get(self._rule["id"], {}) if tracker else {}
++        return {
++            **(super().extra_state_attributes or {}),
++            "rule_id": self._rule["id"],
++            "rule_name": self._rule["name"],
++            "rule_type": self._rule["type"],
++            "channel": self._rule["channel"],
++            "rule_source": self._rule["source"],
++            **details,
++        }
++
++    async def async_added_to_hass(self):
++        self.async_on_remove(self._coordinator.add_ivs_rule_listener(
++            self._rule["id"], self.schedule_update_ha_state,
++        ))
++
++    @property
++    def should_poll(self):
+         return False
+ 
+ 
+--- a/custom_components/dahua/client.py
++++ b/custom_components/dahua/client.py
+@@ -21,6 +21,10 @@
+ 
+ SECURITY_LIGHT_TYPE = 1
+ SIREN_TYPE = 2
++
++# Serialize the optional one-time RPC2 reads from entries on the same NVR.
++# These isolated sessions never replace the hybrid's event-stream session.
++_IVS_DISCOVERY_LOCKS = {}
+ 
+ 
+ class DahuaClient:
+@@ -261,6 +265,41 @@
+         table.VideoAnalyseRule[0][1].Name=IVS-1
+         """
+         return await self.async_get_config("VideoAnalyseRule")
++
++    async def async_get_remote_ivs_rules(self, channel: int):
++        """Read one NVR channel's IVS rules through a short-lived RPC2 session."""
++        lock = _IVS_DISCOVERY_LOCKS.setdefault(self._base, asyncio.Lock())
++        async with lock:
++            async with asyncio.timeout(TIMEOUT_SECONDS):
++                async with self._new_rpc2_session() as session:
++                    rpc2 = DahuaRpc2Client(
++                        self._username, self._password, self._address,
++                        self._port, self._rtsp_port, session,
++                    )
++                    try:
++                        await rpc2.login()
++                        response = await rpc2.request(
++                            "configManager.getConfig",
++                            params={
++                                "name": "RemoteVideoAnalyseRule",
++                                "onlyLocal": False,
++                                "channel": int(channel),
++                            },
++                        )
++                        params = response.get("params")
++                        table = params.get("table") if isinstance(params, dict) else None
++                        if not isinstance(table, list) or any(
++                            not isinstance(row, dict) for row in table
++                        ):
++                            raise ValueError("RemoteVideoAnalyseRule table is malformed")
++                        return table
++                    finally:
++                        # Bound cleanup too: cancellation of the outer read
++                        # deadline must not leave logout waiting indefinitely.
++                        try:
++                            await asyncio.wait_for(rpc2.logout(), timeout=3)
++                        except Exception:
++                            _LOGGER.debug("Optional IVS discovery logout failed", exc_info=True)
+ 
+     async def async_set_all_ivs_rules(self, channel: int, enabled: bool):
+         """
+--- a/custom_components/dahua/manifest.json
++++ b/custom_components/dahua/manifest.json
+@@ -11,5 +11,5 @@
+   "documentation": "https://github.com/rroller/dahua",
+   "iot_class": "local_polling",
+   "issue_tracker": "https://github.com/rroller/dahua/issues",
+-  "version": "0.9.84.1"
++  "version": "0.9.84.2"
+ }
+--- /dev/null
++++ b/custom_components/dahua/ivs.py
+@@ -0,0 +1,137 @@
++"""Read-only IVS rule discovery and event state for the 0.9.84 hybrid.
++
++The stable Id, not the array index or rule name, identifies a rule. NVRs may
++report different Ids via different APIs, so unmatched events are never guessed.
++"""
++import re
++from collections import Counter
++
++
++def rule_id(value):
++    """Return an unambiguous scalar rule identifier, including zero."""
++    if isinstance(value, bool) or not isinstance(value, (int, str)):
++        return None
++    value = str(value).strip()
++    return value if value else None
++
++
++def rules_from_flat(table, channel, table_name="VideoAnalyseRule"):
++    """Select complete normal IVS rows belonging to exactly this channel."""
++    if not isinstance(table, dict):
++        return []
++    pattern = re.compile(
++        rf"table\.{re.escape(table_name)}\[{int(channel)}\]\[(\d+)\]\.Id"
++    )
++    rows = []
++    counts = Counter()
++    for key, value in table.items():
++        if not isinstance(key, str):
++            continue
++        match = pattern.fullmatch(key)
++        identity = rule_id(value)
++        if not match or identity is None:
++            continue
++        counts[identity] += 1
++        prefix = key[:-3]
++        kind = table.get(prefix + ".Type")
++        if table.get(prefix + ".Class") != "Normal":
++            continue
++        if table.get(prefix + ".Enable") not in (True, False, "true", "false"):
++            continue
++        if not isinstance(kind, str) or not kind:
++            continue
++        name = table.get(prefix + ".Name")
++        rows.append({
++            "id": identity,
++            "index": int(match[1]),
++            "channel": int(channel),
++            "name": name if isinstance(name, str) and name else f"IVS Rule {identity}",
++            "type": kind,
++            "source": table_name,
++        })
++    return sorted(
++        (row for row in rows if counts[row["id"]] == 1),
++        key=lambda row: row["index"],
++    )
++
++
++def rules_from_remote(table, channel):
++    """Normalize the per-channel RemoteVideoAnalyseRule RPC2 response."""
++    if not isinstance(table, list) or any(not isinstance(row, dict) for row in table):
++        raise ValueError("RemoteVideoAnalyseRule is not a list of rule objects")
++    flat = {}
++    for index, row in enumerate(table):
++        prefix = f"table.RemoteVideoAnalyseRule[{int(channel)}][{index}]"
++        for name in ("Id", "Class", "Enable", "Name", "Type"):
++            if name in row:
++                flat[prefix + "." + name] = row[name]
++    return rules_from_flat(flat, channel, "RemoteVideoAnalyseRule")
++
++
++class IVSRuleTracker:
++    """Keep IVS state separate from the hybrid's existing event sensors."""
++
++    def __init__(self, rules):
++        self.rules = {row["id"]: dict(row) for row in rules}
++        self.states = {identity: False for identity in self.rules}
++        self.details = {identity: {} for identity in self.rules}
++        self.active = {}
++        self.unmatched_count = 0
++        self.last_unmatched = None
++
++    def apply(self, event):
++        """Return changed rule IDs; one code-level Stop clears concurrent rules."""
++        if not isinstance(event, dict):
++            return []
++        code = event.get("Code")
++        action = event.get("action", event.get("Action"))
++        if not isinstance(code, str) or action not in ("Start", "Stop"):
++            return []
++        payload = event.get("data", event.get("Data", {}))
++        payload = payload if isinstance(payload, dict) else {}
++
++        if action == "Stop":
++            # A Dahua Stop can name only the first rule, or omit data entirely.
++            # Clear the rules this code lit, retaining each rule's own metadata.
++            identities = set(self.active.pop(code, ()))
++            identities.update(
++                identity for identity, row in self.rules.items()
++                if row["type"] == code and self.states[identity]
++            )
++            changed = []
++            for identity in sorted(identities):
++                if self.states[identity]:
++                    self.states[identity] = False
++                    changed.append(identity)
++            return changed
++
++        if payload.get("Class") != "Normal":
++            return []
++        identity = rule_id(payload.get("RuleID"))
++        if identity is None:
++            identity = rule_id(payload.get("RuleId"))
++        row = self.rules.get(identity)
++        if row is None or row["type"] != code:
++            # Ignore unrelated event types (for example HumanTrait).
++            if any(item["type"] == code for item in self.rules.values()):
++                self.unmatched_count += 1
++                self.last_unmatched = {
++                    "code": code,
++                    "rule_id": identity,
++                    "reason": "missing_or_unknown_id" if row is None else "rule_type_mismatch",
++                }
++            return []
++
++        obj = payload.get("Object")
++        obj = obj if isinstance(obj, dict) else {}
++        details = {}
++        direction = payload.get("Direction")
++        if isinstance(direction, str) and direction:
++            details["direction"] = direction
++        object_type = obj.get("ObjectType")
++        if isinstance(object_type, str) and object_type.lower() != "unknown":
++            details["object_type"] = object_type
++        self.details[identity] = details
++        self.states[identity] = True
++        self.active.setdefault(code, set()).add(identity)
++        return [identity]

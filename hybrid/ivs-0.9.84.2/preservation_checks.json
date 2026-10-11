@@ -1,0 +1,18 @@
+{
+  "__init__.py": {
+    "_async_stream_events": "33f18435244091b7ce02a48730055eb5074390a68df95b6c9ef39a90bbb8ee04",
+    "translate_event_code": "a0ea2fbca22cdcb468533e77ce6435751de5d1b0e3b392508f0359075e708fec",
+    "get_event_timestamp": "051a2af6159e8be239fb5b613af4f1719b5e15282ea3f3d7f436d9fbb52680c0",
+    "add_dahua_event_listener": "99db11f8b884b28fb1a74119cec81d233641bfdd72fdd6c8a014713e1b767d75",
+    "_handle_anpr_plate": "0b2af3c901e7f608908815fb4711490d8677f2b6ee6c95a319fab465d6fe592c",
+    "is_plate_authorized": "56bfaa4fc230c0e6ce83fcfba4c91e13994022108c87b51529d2f31bde622061"
+  },
+  "client.py": {
+    "stream_events": "59cdb9110de42c44998a1fef2e0ee5691b6845978c2d74127ffdaa4485b5e873"
+  },
+  "binary_sensor.py": {
+    "DahuaEventSensor": "da55c6228227b560649b263856a7eb4770c81c5b8f8e92731658f0fdd02dac7f",
+    "DahuaAuthorizedVehicleBinarySensor": "9022293de247021f3aa6015c58c3021e54d85ff1a2d8cebc2a2ce912978d5283"
+  },
+  "config_flow_sha256": "9f3019da7e916236b0baba3a2b711a5c5ed51bdb9b544a8bab4fef5bea058b27"
+}

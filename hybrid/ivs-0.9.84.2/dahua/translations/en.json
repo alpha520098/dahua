@@ -1,0 +1,60 @@
+{
+    "config": {
+        "step": {
+            "user": {
+                "title": "Add Dahua Camera",
+                "description": "Example address: 192.168.1.108",
+                "data": {
+                    "username": "Username",
+                    "password": "Password",
+                    "address": "Address",
+                    "port": "Port",
+                    "rtsp_port": "RTSP Port",
+                    "streams": "RTSP Streams",
+                    "events": "Events",
+                    "channel": "Channel (single cameras are 0, NVRs are the 0 based index)"
+                }
+            },
+            "name": {
+                "title": "Configure Device Name",
+                "data": {
+                    "name": "Device Name"
+                }
+            },
+            "reauth_confirm": {
+                "title": "Re-authenticate Dahua Camera",
+                "description": "The credentials for {name} are no longer valid. Please enter updated credentials.",
+                "data": {
+                    "username": "Username",
+                    "password": "Password"
+                }
+            }
+        },
+        "error": {
+            "auth": "Username, Password, or Address is wrong."
+        },
+        "abort": {
+            "single_instance_allowed": "Only a single instance is allowed.",
+            "already_configured": "Only a single instance of a device is allowed.",
+            "reauth_successful": "Re-authentication was successful."
+        }
+    },
+    "options": {
+        "step": {
+            "user": {
+                "data": {
+                    "binary_sensor": "Binary sensor enabled",
+                    "sensor": "Sensor enabled",
+                    "switch": "Switch enabled",
+                    "light": "Light enabled",
+                    "select": "Select enabled",
+                    "camera": "Camera enabled",
+                    "auto_detect_channel": "Auto-detect channel index (disable if HTTP snapshot at channel=0 works but RTSP only streams on channel=1)",
+                    "events": "Events to subscribe to",
+                    "authorized_plates": "Authorized license plates (comma-separated, e.g. ABC123, XYZ789)",
+                    "authorized_hold_time": "Authorized Vehicle hold time in seconds"
+                }
+            }
+        }
+    }
+}
